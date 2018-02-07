@@ -1,0 +1,73 @@
+#!/bin/bash -e
+##############################################################################
+# Copyright (c) 2017 Mirantis Inc., Enea AB and others.
+# All rights reserved. This program and the accompanying materials
+# are made available under the terms of the Apache License, Version 2.0
+# which accompanies this distribution, and is available at
+# http://www.apache.org/licenses/LICENSE-2.0
+##############################################################################
+
+CI_DEBUG=${CI_DEBUG:-0}; [[ "${CI_DEBUG}" =~ (false|0) ]] || set -x
+ERASE_ENV=${ERASE_ENV:-0}
+
+# shellcheck disable=SC1090
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib.sh"
+
+# Optionally destroy VCP VMs from a previous run
+if [ "${ERASE_ENV}" -eq 1 ]; then
+    kvm_vms=$(salt --out yaml 'kvm*' virt.list_domains | \
+              sed -e 's/- //g' -e 's/:.*$//g')
+    for line in ${kvm_vms}; do
+        if [[ "${line}" =~ ^kvm ]]; then
+            kvm_node=${line}
+        elif [ -n "${kvm_node}" ]; then
+            salt "${kvm_node}" virt.purge dirs=True "${line}" || true
+        fi
+    done
+fi
+
+# KVM libvirt first, VCP deployment
+wait_for 5.0 "salt -C 'kvm*' state.sls libvirt"
+
+salt -C 'kvm* or cmp*' state.apply salt
+wait_for 10.0 "salt -C 'kvm*' state.sls salt.control"
+
+vcp_nodes=$(salt --out yaml 'kvm01*' pillar.get salt:control:cluster:internal:node | \
+            awk '/\s+\w+:$/ {gsub(/:$/, "*"); print $1}')
+
+# Check all vcp nodes are available
+rc=1
+attempt=0
+total_attempts=50
+while [ $rc -ne 0 ] && [ ${attempt} -lt ${total_attempts} ]; do
+  rc=0
+  for node in $vcp_nodes; do
+    salt "$node" test.ping 2>/dev/null || { rc=$?; break; };
+  done
+  sleep 5
+  ((attempt+=1))
+done
+
+wait_for 10.0 "salt -C '* and not cfg01* and not mas01*' saltutil.sync_all"
+
+# Propagate APT proxy config created by curtin on baremetal nodes to VCP VMs
+APT_CONF_D_CURTIN='/etc/apt/apt.conf.d/90curtin-aptproxy'
+salt -C 'kvm01*' cp.push "${APT_CONF_D_CURTIN}"
+cd /srv/salt/env/prd/maas/files && ln -sf \
+  /var/cache/salt/master/minions/kvm01.*/files/${APT_CONF_D_CURTIN}
+salt -C 'E@^(?!cfg01|mas01|kvm|cmp00).*' cp.get_file \
+  "salt://maas/files/$(basename "${APT_CONF_D_CURTIN}")" "${APT_CONF_D_CURTIN}"
+
+wait_for 10 "salt -C 'E@^(?!cfg01|mas01|kvm|cmp00).*' state.apply salt"
+wait_for 10.0 "salt -C 'E@^(?!cfg01|mas01|kvm|cmp00).*' state.apply linux,ntp"
+
+wait_for 10.0 "salt -C 'E@^(?!cfg01|mas01|kvm|cmp00).*' ssh.set_auth_key ${SUDO_USER} \
+  $(awk 'NR==1{print $2}' "$(eval echo "~${SUDO_USER}/.ssh/authorized_keys")")"
+
+# Disable proxy dhcp routes after installation
+salt -C 'prx*' file.write /etc/dhcp/dhclient-enter-hooks.d/no-default-route \
+  args='unset new_routers'
+salt -C 'prx*' system.reboot
+wait_for 30.0 "salt -C 'prx*' test.ping"
+
+salt -C 'E@^(?!cfg01|mas01|kvm|cmp00).*' pkg.upgrade refresh=False

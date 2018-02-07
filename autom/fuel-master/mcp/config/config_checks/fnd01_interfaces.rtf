@@ -1,0 +1,76 @@
+auto lo
+iface lo inet loopback
+
+auto eno1
+iface eno1 inet manual
+    bond-master bond0
+
+auto eno2
+iface eno2 inet manual
+    bond-master bond0
+
+auto bond0
+iface bond0 inet manual
+    bond-ad_select 0
+    bond-downdelay 200
+    bond-lacp_rate 0
+    bond-miimon 100
+    bond-mode 4
+    bond-slaves eno1 eno2
+    bond-updelay 0
+    bond-use_carrier on
+
+auto br-mgm
+iface br-mgm inet static
+    address 192.168.0.230
+    netmask 255.255.255.0
+    gateway 192.168.0.254
+    bridge_ports bond0
+    auto bond0.2
+
+iface bond0.2 inet manual
+    vlan-raw-device bond0
+
+auto bond0.3
+iface bond0.3 inet manual
+    vlan-raw-device bond0
+
+auto br-ipmi
+iface br-ipmi inet manual
+    bridge_ports bond0.3
+
+auto br-ctl
+iface br-ctl inet static
+    address 192.168.2.230
+    netmask 255.255.255.0
+    bridge_ports bond0.2
+
+auto ens1f0
+iface ens1f0 inet manual
+    bond-master bond1
+
+auto ens1f1
+iface ens1f1 inet manual
+    bond-master bond1
+
+auto bond1
+iface bond1 inet manual
+    bond-ad_select 0
+    bond-downdelay 200
+    bond-lacp_rate 0
+    bond-miimon 100
+    bond-mode 4
+    bond-slaves ens1f0 ens1f1
+    bond-updelay 0
+    bond-use_carrier on
+
+auto bond1.22
+iface bond1.22 inet manual
+    vlan-raw-device bond1
+
+auto br-prx
+iface br-prx inet manual
+    bridge_ports bond1.22
+#    address 192.168.0.100
+#    netmask 255.255.255.224
+#    gateway 10.33.188.97

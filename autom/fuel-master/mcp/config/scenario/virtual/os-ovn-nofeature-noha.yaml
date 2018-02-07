@@ -1,0 +1,30 @@
+##############################################################################
+# Copyright (c) 2017 Mirantis Inc., Enea AB and others.
+# All rights reserved. This program and the accompanying materials
+# are made available under the terms of the Apache License, Version 2.0
+# which accompanies this distribution, and is available at
+# http://www.apache.org/licenses/LICENSE-2.0
+##############################################################################
+---
+cluster:
+  domain: virtual-mcp-pike-ovn-noha.local
+  states:
+    - openstack_noha
+    - ovn_ctl_opts
+    - neutron_compute
+    - networks
+virtual:
+  nodes:
+    - cfg01
+    - ctl01
+    - cmp01
+    - cmp02
+  ctl01:
+    vcpus: 4
+    ram: 14336
+  cmp01:
+    vcpus: 5
+    ram: 8192
+  cmp02:
+    vcpus: 5
+    ram: 8192

@@ -1,0 +1,16 @@
+*.pyc
+.cache*
+.project
+.pydevproject
+**/ci/config/
+**/deploy/autodeploy.log
+*~
+.*.sw?
+**/docs_build/
+**/docs_output/
+**/releng/
+**/mcp/deploy/images/
+**/mcp/scripts/mcp.rsa*
+**/mcp/scripts/user-data.sh
+**/mcp/scripts/net_mcpcontrol.xml
+**/mcp/scripts/*.img

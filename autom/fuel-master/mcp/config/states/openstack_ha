@@ -1,0 +1,86 @@
+#!/bin/bash -e
+##############################################################################
+# Copyright (c) 2017 Mirantis Inc., Enea AB and others.
+# All rights reserved. This program and the accompanying materials
+# are made available under the terms of the Apache License, Version 2.0
+# which accompanies this distribution, and is available at
+# http://www.apache.org/licenses/LICENSE-2.0
+##############################################################################
+
+CI_DEBUG=${CI_DEBUG:-0}; [[ "${CI_DEBUG}" =~ (false|0) ]] || set -x
+
+# shellcheck disable=SC1090
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib.sh"
+
+salt -I 'keepalived:cluster' state.sls keepalived -b 1
+salt -I 'keepalived:cluster' pillar.get keepalived:cluster:instance:VIP:address
+
+salt -C 'I@rabbitmq:server and *01*' state.sls rabbitmq
+salt -I 'rabbitmq:server' state.sls rabbitmq
+salt -I 'rabbitmq:server' cmd.run "rabbitmqctl cluster_status"
+
+salt -I 'glusterfs:server' state.sls glusterfs.server.service
+salt -I 'glusterfs:server' state.sls glusterfs.server.setup -b 1
+salt -I 'glusterfs:server' cmd.run "gluster peer status; gluster volume status" -b 1
+salt -I 'glusterfs:client' state.sls glusterfs.client
+
+salt -I 'galera:master' state.sls galera
+salt -I 'galera:slave' state.sls galera
+salt -I 'galera:master' mysql.status | grep -A1 wsrep_cluster_size
+
+salt -I 'memcached:server' state.sls memcached
+
+salt -I 'haproxy:proxy' state.sls haproxy
+salt -I 'haproxy:proxy' service.status haproxy
+salt -I 'haproxy:proxy' service.restart rsyslog
+
+set +e; salt -I 'keystone:server' state.sls keystone.server -b 1; set -e
+salt -I 'keystone:server' service.restart apache2
+salt -I 'keystone:server' state.sls keystone.server -b 1
+
+wait_for 30 "salt -I 'keystone:client' state.sls keystone.client"
+salt -I 'keystone:server' cmd.run ". /root/keystonercv3; openstack service list"
+
+salt -I 'glance:server' state.sls glance -b 1
+salt -I 'nova:controller' state.sls nova -b 1
+salt -I 'heat:server' state.sls heat -b 1
+
+wait_for 5 "salt -I 'cinder:controller' state.sls cinder -b 1"
+wait_for 3 "salt -I 'cinder:volume' state.sls cinder"
+
+salt -I 'neutron:server' state.sls neutron -b 1
+salt -I 'neutron:gateway' state.sls neutron.gateway
+
+salt -I 'nova:compute' state.sls nova
+
+salt -C 'I@mongodb:server and *01*' state.sls mongodb || true
+wait_for 10 "salt -C 'I@mongodb:server and *01*' cmd.run 'mongo localhost:27017/admin'"
+salt -C 'I@mongodb:server and *01*' cmd.run 'mongo localhost:27017/admin --eval "rs.initiate()"'
+salt -I 'mongodb:server' state.sls mongodb
+
+salt -I 'aodh:server' state.sls aodh -b 1
+salt -I 'ceilometer:server' state.sls ceilometer
+salt -I 'ceilometer:agent' state.sls ceilometer
+
+salt -I 'horizon:server' state.sls horizon
+salt -I 'nginx:server' state.sls nginx,sphinx
+
+# workaround for the pike horizon is missing css, FUEL-324
+salt -I 'horizon:server' file.symlink \
+  /var/lib/openstack-dashboard/static \
+  /usr/share/openstack-dashboard/static
+salt -I 'horizon:server' cmd.run "/usr/share/openstack-dashboard/manage.py collectstatic --noinput"
+salt -I 'horizon:server' cmd.run "/usr/share/openstack-dashboard/manage.py compress --force"
+salt -I 'horizon:server' file.append /etc/openstack-dashboard/local_settings.py \
+ "AVAILABLE_THEMES = [ ('default', 'Default', 'themes/default'),]"
+salt -I 'horizon:server' service.reload apache2
+
+clstr_vip_addr=$(salt -C 'I@nginx:server and *01*' --out=yaml \
+  pillar.get _param:cluster_vip_address | awk '{print $2; exit}')
+salt -C 'I@nginx:server and *01*' cp.push \
+  "/etc/ssl/certs/${clstr_vip_addr}-with-chain.crt" upload_path='certs/os_cacert'
+cd /etc/ssl/certs && ln -sf /var/cache/salt/master/minions/prx01.*/files/certs/os_cacert
+
+# glance v1 api is required by orchestra tests
+salt -I 'glance:server' ini.set_option /etc/glance/glance-api.conf '{DEFAULT: {enable_v1_api: True}}'
+salt -I 'glance:server' service.restart glance-api

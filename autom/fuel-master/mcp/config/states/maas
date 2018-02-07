@@ -1,0 +1,104 @@
+#!/bin/bash -e
+# shellcheck disable=SC1090,SC2155
+##############################################################################
+# Copyright (c) 2017 Mirantis Inc., Enea AB and others.
+# All rights reserved. This program and the accompanying materials
+# are made available under the terms of the Apache License, Version 2.0
+# which accompanies this distribution, and is available at
+# http://www.apache.org/licenses/LICENSE-2.0
+##############################################################################
+
+CI_DEBUG=${CI_DEBUG:-0}; [[ "${CI_DEBUG}" =~ (false|0) ]] || set -x
+ERASE_ENV=${ERASE_ENV:-0}
+
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/globals.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib.sh"
+
+# Wait for MaaS commissioning/deploy to finish, retry on failure
+function maas_fixup() {
+  local statuscmd="salt 'mas01*' --out yaml state.apply maas.machines.status"
+  local ncount=$(salt --out yaml 'mas01*' pillar.get maas:region:machines | \
+    grep -cE '^\s{2}\w+:$')
+
+  # wait_for has 10sec timeout * 96 = 16 min > 15min for Failed state
+  wait_for 96 "${statuscmd} | tee /dev/stderr | " \
+    "grep -Eq '((Deployed|Ready): ${ncount}|status: (Failed|Allocated))'"
+  local statusout=$(eval "${statuscmd}")
+
+  local fcnodes=$(echo "${statusout}" | \
+    grep -Pzo 'status: Failed commissioning\n\s+system_id: \K.+\n')
+  for node_system_id in ${fcnodes}; do
+    salt -C 'mas01*' state.apply maas.machines.delete \
+      pillar="{'system_id': '${node_system_id}'}"
+    sleep 10
+  done
+  if [ -n "${fcnodes}" ]; then
+    salt -C 'mas01*' state.apply maas.machines
+    return 1
+  fi
+
+  local fdnodes=$(echo "${statusout}" | \
+    grep -Pzo 'status: (Failed deployment|Allocated)\n\s+system_id: \K.+\n')
+  local rnodes=$(echo "${statusout}" | \
+    grep -Pzo 'status: Ready\n\s+system_id: \K.+\n')
+  for node_system_id in ${fdnodes}; do
+    salt -C 'mas01*' state.apply maas.machines.mark_broken_fixed \
+      pillar="{'system_id': '${node_system_id}'}"
+    sleep 10
+  done
+  if [ -n "${fdnodes}" ] || [ -n "${rnodes}" ]; then
+    salt -C 'mas01*' state.apply maas.machines.deploy
+    return 1
+  fi
+
+  return 0
+}
+
+# Optionally destroy MaaS machines from a previous run
+if [ "${ERASE_ENV}" -gt 1 ]; then
+  set +e; dnodes=$(salt 'mas01*' --out yaml state.apply maas.machines.status | \
+    grep -Pzo '\s+system_id: \K.+\n'); set -e
+  cleanup_uefi
+  for node_system_id in ${dnodes}; do
+    salt -C 'mas01*' state.apply maas.machines.delete \
+      pillar="{'system_id': '${node_system_id}'}"
+    sleep 10
+  done
+fi
+
+# MaaS rack/region controller, node commissioning
+salt -C 'mas01*' state.apply linux,salt,openssh,ntp
+salt -C 'mas01*' state.apply maas.cluster
+
+wait_for 10 "salt -C 'mas01*' state.apply maas.region"
+
+salt -C 'mas01*' state.apply maas.machines
+
+# cleanup outdated salt keys
+sleep 30
+salt-key --out yaml | awk '!/^(minions|- cfg01|- mas01)/ {print $2}' | \
+  xargs -I{} salt-key -yd {}
+
+# MaaS node deployment
+wait_for 10 maas_fixup
+
+salt -C 'mas01*' pillar.item\
+  maas:region:admin:username \
+  maas:region:admin:password
+
+# Check all baremetal nodes are available
+rc=1
+attempt=0
+total_attempts=10
+while [ $rc -ne 0 ] && [ ${attempt} -lt ${total_attempts} ]; do
+  bm_nodes=$(salt --out yaml 'mas01*' pillar.get maas:region:machines | \
+             awk '/^\s+\w+[[:digit:]]+:$/ {gsub(/:$/, "*"); print $1}')
+  rc=0
+  for node in $bm_nodes; do
+    salt "$node" test.ping 2>/dev/null || { rc=$?; break; };
+  done
+  sleep 5
+  ((attempt+=1))
+done
+
+wait_for 10.0 "salt -C '* and not cfg01* and not mas01*' saltutil.sync_all"

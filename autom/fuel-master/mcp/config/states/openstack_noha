@@ -1,0 +1,63 @@
+#!/bin/bash -e
+##############################################################################
+# Copyright (c) 2017 Mirantis Inc., Enea AB and others.
+# All rights reserved. This program and the accompanying materials
+# are made available under the terms of the Apache License, Version 2.0
+# which accompanies this distribution, and is available at
+# http://www.apache.org/licenses/LICENSE-2.0
+##############################################################################
+
+CI_DEBUG=${CI_DEBUG:-0}; [[ "${CI_DEBUG}" =~ (false|0) ]] || set -x
+
+# shellcheck disable=SC1090
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib.sh"
+
+salt -I 'nfs:server' file.mkdir /srv/nova/instances
+salt -I 'nfs:server' state.sls nfs
+salt -I 'nfs:client' state.sls nfs
+
+salt -I 'rabbitmq:server' state.sls rabbitmq
+salt -I 'rabbitmq:server' cmd.run "rabbitmqctl status"
+
+salt -I 'mysql:server' state.sls mysql
+salt -I 'memcached:server' state.sls memcached
+salt -I 'haproxy:proxy' state.sls haproxy
+
+set +e; salt -I 'keystone:server' state.sls keystone.server; set -e
+salt -I 'keystone:server' service.restart apache2
+salt -I 'keystone:server' state.sls keystone.server
+
+salt -I 'keystone:server' state.sls keystone.client
+salt -I 'keystone:server' cmd.run ". /root/keystonercv3; openstack service list"
+
+salt -I 'glance:server' state.sls glance
+
+# apply nova state twice to complete broken db sync
+salt -I 'nova:controller' state.sls nova
+salt -I 'nova:controller' state.sls nova
+
+salt -I 'heat:server' state.sls heat
+
+salt -I 'cinder:controller' state.sls cinder
+wait_for 3 "salt -I 'cinder:volume' state.sls cinder"
+
+salt -I 'neutron:server' state.sls neutron
+
+salt -I 'nova:compute' state.sls nova
+
+wait_for 3 "salt -I 'mongodb:server' state.sls mongodb"
+salt -I 'aodh:server' state.sls aodh
+salt -I 'ceilometer:server' state.sls ceilometer
+salt -I 'ceilometer:agent' state.sls ceilometer
+
+salt -I 'horizon:server' state.sls horizon
+
+# workaround for the pike horizon is missing css, FUEL-324
+salt -I 'horizon:server' file.symlink \
+  /var/lib/openstack-dashboard/static \
+  /usr/share/openstack-dashboard/static
+salt -I 'horizon:server' cmd.run "/usr/share/openstack-dashboard/manage.py collectstatic --noinput"
+salt -I 'horizon:server' cmd.run "/usr/share/openstack-dashboard/manage.py compress --force"
+salt -I 'horizon:server' file.append /etc/openstack-dashboard/local_settings.py \
+  "AVAILABLE_THEMES = [ ('default', 'Default', 'themes/default'),]"
+salt -I 'horizon:server' service.reload apache2
